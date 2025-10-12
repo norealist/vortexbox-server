@@ -10,12 +10,10 @@ sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decod
 app = FastAPI()
 
 class RegisterRequest(BaseModel):
-    type: str
     login: str
     password: str
 
 class LoginRequest(BaseModel):
-    type: str
     login: str
     password: str
 
@@ -45,9 +43,6 @@ async def cleanup_middleware(request, call_next):
 
 @app.post('/register')
 def register(request: RegisterRequest):
-    if request.type != 'reg':
-        raise HTTPException(status_code=400, detail='Invalid request type')
-    
     conn = sqlite3.connect('polzovateli.db', detect_types=sqlite3.PARSE_DECLTYPES)
     try:
         conn.execute('INSERT INTO users (login, password) VALUES (?, ?)', (request.login, request.password))
@@ -66,9 +61,6 @@ def register(request: RegisterRequest):
 
 @app.post('/login')
 def login(request: LoginRequest):
-    if request.type != 'login':
-        raise HTTPException(status_code=400, detail='Invalid request type')
-    
     conn = sqlite3.connect('polzovateli.db', detect_types=sqlite3.PARSE_DECLTYPES)
     try:
         user = conn.execute('SELECT * FROM users WHERE login = ? AND password = ?', 
@@ -93,4 +85,4 @@ def login(request: LoginRequest):
 if __name__ == '__main__':
     import uvicorn
     init_db()
-    uvicorn.run(app, host='0.0.0.0', port=8000)
+    uvicorn.run(app, host='127.0.0.1', port=8000)
