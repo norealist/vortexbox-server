@@ -1,53 +1,17 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Depends
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.responses import FileResponse
-from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
-from contextlib import asynccontextmanager
-import redis.asyncio as redis
 from pydantic import BaseModel
 import sqlite3
 import uuid
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-import argparse
 
-# --- Config & Setup ---
 sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
 sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
 
-def init_db():
-    conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
-    conn.execute('CREATE TABLE IF NOT EXISTS users (login TEXT PRIMARY KEY, password TEXT)')
-    conn.execute('CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, login TEXT, expires TIMESTAMP)')
-    
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_login ON sessions(login)')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires)')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_users_login_password ON users(login, password)')
-    
-    conn.close()
-    
-    if not os.path.exists('users'):
-        os.makedirs('users')
+app = FastAPI()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Инициализация БД
-    init_db()
-    
-    # Инициализация Redis для лимитера
-    # Предполагаем, что Redis запущен на localhost:6379
-    redis_connection = redis.from_url("redis://localhost:6379", encoding="utf-8", decode_responses=True)
-    await FastAPILimiter.init(redis_connection)
-    
-    yield
-    
-    # Закрытие соединения при остановке
-    await redis_connection.close()
-
-app = FastAPI(lifespan=lifespan)
-
-# --- Models ---
 class RegisterRequest(BaseModel):
     login: str
     password: str
@@ -67,7 +31,20 @@ class DeleteRequest(BaseModel):
     session_id: str
     path: str
 
-# --- Helpers ---
+def init_db():
+    conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.execute('CREATE TABLE IF NOT EXISTS users (login TEXT PRIMARY KEY, password TEXT)')
+    conn.execute('CREATE TABLE IF NOT EXISTS sessions (session_id TEXT PRIMARY KEY, login TEXT, expires TIMESTAMP)')
+    
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_login ON sessions(login)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_users_login_password ON users(login, password)')
+    
+    conn.close()
+    
+    if not os.path.exists('users'):
+        os.makedirs('users')
+
 def clean_sessions():
     conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
     conn.execute('DELETE FROM sessions WHERE expires < ?', (datetime.now(),))
@@ -85,17 +62,13 @@ def validate_session(session_id: str):
     finally:
         conn.close()
 
-# --- Middleware ---
 @app.middleware("http")
 async def cleanup_middleware(request, call_next):
     clean_sessions()
     response = await call_next(request)
     return response
 
-# --- Routes ---
-
-# Group 1: 10 requests per minute
-@app.post('/register', dependencies=[Depends(RateLimiter(times=10, seconds=60))])
+@app.post('/register')
 def register(request: RegisterRequest):
     conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
     try:
@@ -117,7 +90,7 @@ def register(request: RegisterRequest):
     finally:
         conn.close()
 
-@app.post('/login', dependencies=[Depends(RateLimiter(times=10, seconds=60))])
+@app.post('/login')
 def login(request: LoginRequest):
     conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
     try:
@@ -138,24 +111,7 @@ def login(request: LoginRequest):
     finally:
         conn.close()
 
-@app.post('/logout', dependencies=[Depends(RateLimiter(times=10, seconds=60))])
-def logout(request: LogoutRequest):
-    conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
-    try:
-        session = conn.execute('SELECT * FROM sessions WHERE session_id = ?', (request.session_id,)).fetchone()
-        if not session:
-            return {'status': 'Session not found'}
-        
-        conn.execute('DELETE FROM sessions WHERE session_id = ?', (request.session_id,))
-        conn.commit()
-        return {'status': 'OK'}
-    except Exception as e:
-        return {'status': str(e)}
-    finally:
-        conn.close()
-
-# Group 2: 500 requests per minute
-@app.post('/ls', dependencies=[Depends(RateLimiter(times=500, seconds=60))])
+@app.post('/ls')
 def list_files(request: ListRequest):
     login = validate_session(request.session_id)
     if not login:
@@ -174,52 +130,23 @@ def list_files(request: ListRequest):
     except OSError:
         raise HTTPException(status_code=500, detail='Error accessing user directory')
 
-@app.get('/fileInfo/{filename}', dependencies=[Depends(RateLimiter(times=500, seconds=60))])
-def get_file_info(filename: str, session_id: str):
-    login = validate_session(session_id)
-    if not login:
-        return {'status': 'Invalid session'}
-    
-    safe_login = ''.join(c for c in login if c.isalnum() or c in '_-')
-    safe_filename = os.path.basename(filename)
-    
-    if not safe_filename or '..' in safe_filename:
-        return {'status': 'Invalid filename'}
-    
-    user_dir = os.path.join('users', safe_login)
-    file_path = os.path.join(user_dir, safe_filename)
-    
+@app.post('/logout')
+def logout(request: LogoutRequest):
+    conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
     try:
-        if not os.path.abspath(file_path).startswith(os.path.abspath(user_dir)):
-            return {'status': 'Access denied'}
+        session = conn.execute('SELECT * FROM sessions WHERE session_id = ?', (request.session_id,)).fetchone()
+        if not session:
+            return {'status': 'Session not found'}
         
-        if not os.path.exists(file_path):
-            return {'status': 'File not found'}
-            
-        stats = os.stat(file_path)
-        
-        # Helper to format timestamp
-        def format_ts(ts):
-            return datetime.fromtimestamp(ts).strftime('%d-%m-%Y %H-%M-%S')
-            
-        uploaded_str = format_ts(stats.st_mtime)
-        
-        file_info = {
-            "name": safe_filename,
-            "uploaded": uploaded_str,
-            "size": stats.st_size
-        }
-            
-        return {
-            "status": "OK",
-            "fileInfo": file_info
-        }
-        
-    except OSError:
-        return {'status': 'Error reading file info'}
+        conn.execute('DELETE FROM sessions WHERE session_id = ?', (request.session_id,))
+        conn.commit()
+        return {'status': 'OK'}
+    except Exception as e:
+        return {'status': str(e)}
+    finally:
+        conn.close()
 
-# Group 3: 100 requests per minute
-@app.post('/del', dependencies=[Depends(RateLimiter(times=100, seconds=60))])
+@app.post('/del')
 def delete_file(request: DeleteRequest):
     login = validate_session(request.session_id)
     if not login:
@@ -244,7 +171,7 @@ def delete_file(request: DeleteRequest):
     except OSError:
         return {'status': 'Error deleting file'}
 
-@app.post('/upload', dependencies=[Depends(RateLimiter(times=100, seconds=60))])
+@app.post('/upload')
 async def upload_file(session_id: str = Form(...), file: UploadFile = File(...)):
     login = validate_session(session_id)
     if not login:
@@ -273,7 +200,7 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
     except OSError:
         return {'status': 'Error uploading file'}
 
-@app.get('/download/{filename}', dependencies=[Depends(RateLimiter(times=100, seconds=60))])
+@app.get('/download/{filename}')
 def download_file(filename: str, session_id: str):
     login = validate_session(session_id)
     if not login:
@@ -296,28 +223,5 @@ def download_file(filename: str, session_id: str):
 
 if __name__ == '__main__':
     import uvicorn
-    
-    parser = argparse.ArgumentParser(description="Start the FastAPI server")
-    parser.add_argument("host", help="Host IP address (e.g. 127.0.0.1)")
-    parser.add_argument("port", type=int, help="Port number (e.g. 8000)")
-    parser.add_argument("--ssl-public-key", help="Path to SSL public key (certificate)")
-    parser.add_argument("--ssl-private-key", help="Path to SSL private key")
-    
-    args = parser.parse_args()
-    
-    uvicorn_kwargs = {
-        "host": args.host,
-        "port": args.port,
-    }
-    
-    if args.ssl_public_key and args.ssl_private_key:
-        if os.path.exists(args.ssl_public_key) and os.path.exists(args.ssl_private_key):
-            uvicorn_kwargs["ssl_certfile"] = args.ssl_public_key
-            uvicorn_kwargs["ssl_keyfile"] = args.ssl_private_key
-            print(f"Starting with SSL. Cert: {args.ssl_public_key}")
-        else:
-            print("Error: One or both SSL key files not found.")
-            exit(1)
-            
-    # init_db is now called in lifespan
-    uvicorn.run(app, **uvicorn_kwargs)
+    init_db()
+    uvicorn.run(app, host='127.0.0.1', port=8000)
