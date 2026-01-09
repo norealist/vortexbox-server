@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import argparse
 
-# --- Config & Setup ---
 sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
 sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
 
@@ -32,22 +31,17 @@ def init_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Инициализация БД
     init_db()
-    
-    # Инициализация Redis для лимитера
-    # Предполагаем, что Redis запущен на localhost:6379
+
     redis_connection = redis.from_url("redis://localhost:6379", encoding="utf-8", decode_responses=True)
     await FastAPILimiter.init(redis_connection)
     
     yield
     
-    # Закрытие соединения при остановке
     await redis_connection.close()
 
 app = FastAPI(lifespan=lifespan)
 
-# --- Models ---
 class RegisterRequest(BaseModel):
     login: str
     password: str
@@ -67,7 +61,6 @@ class DeleteRequest(BaseModel):
     session_id: str
     path: str
 
-# --- Helpers ---
 def clean_sessions():
     conn = sqlite3.connect('users.db', detect_types=sqlite3.PARSE_DECLTYPES)
     conn.execute('DELETE FROM sessions WHERE expires < ?', (datetime.now(),))
@@ -85,7 +78,6 @@ def validate_session(session_id: str):
     finally:
         conn.close()
 
-# --- Middleware ---
 @app.middleware("http")
 async def cleanup_middleware(request, call_next):
     clean_sessions()
